@@ -6,7 +6,7 @@ Exposes an HTTP server with endpoints:
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
-- GET  /v1/models                  — lists hermes-agent as an available model
+- GET  /v1/models                  — lists upstream-supported models when available
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - GET  /health                     — health check
@@ -511,6 +511,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _create_agent(
         self,
+        requested_model: Optional[str] = None,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
@@ -531,7 +532,7 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        model = (requested_model or "").strip() or _resolve_gateway_model()
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -591,26 +592,79 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    def _build_model_entry(self, model_id: str, *, owned_by: str = "hermes") -> Dict[str, Any]:
+        """Build an OpenAI-compatible model object."""
+        return {
+            "id": model_id,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": owned_by,
+            "permission": [],
+            "root": model_id,
+            "parent": None,
+        }
+
+    def _fallback_models_payload(self) -> Dict[str, Any]:
+        """Return the local fallback model list payload."""
+        return {
+            "object": "list",
+            "data": [self._build_model_entry(self._model_name)],
+        }
+
+    async def _fetch_upstream_models_payload(self) -> Optional[Dict[str, Any]]:
+        """Best-effort fetch of the upstream provider's supported model list."""
+        from gateway.run import _resolve_runtime_agent_kwargs
+        from hermes_cli.models import fetch_api_models
+
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except Exception as exc:
+            logger.debug("Failed to resolve runtime provider for /v1/models: %s", exc)
+            return None
+
+        base_url = str(runtime_kwargs.get("base_url") or "").strip()
+        if not base_url:
+            return None
+
+        api_key = str(runtime_kwargs.get("api_key") or "").strip() or None
+        provider = str(runtime_kwargs.get("provider") or "").strip() or "upstream"
+
+        try:
+            model_ids = await asyncio.to_thread(fetch_api_models, api_key, base_url, 5.0)
+        except Exception as exc:
+            logger.debug("Failed to fetch upstream models for /v1/models: %s", exc)
+            return None
+
+        if not model_ids:
+            return None
+
+        seen: set[str] = set()
+        data = []
+        for model_id in model_ids:
+            normalized = str(model_id or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            data.append(self._build_model_entry(normalized, owned_by=provider))
+
+        if not data:
+            return None
+
+        return {
+            "object": "list",
+            "data": data,
+        }
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — return hermes-agent as an available model."""
+        """GET /v1/models — return upstream-supported models when available."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
-        return web.json_response({
-            "object": "list",
-            "data": [
-                {
-                    "id": self._model_name,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "hermes",
-                    "permission": [],
-                    "root": self._model_name,
-                    "parent": None,
-                }
-            ],
-        })
+        payload = await self._fetch_upstream_models_payload()
+        if payload is None:
+            payload = self._fallback_models_payload()
+        return web.json_response(payload)
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -713,6 +767,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
+        requested_model = (body.get("model") or "").strip() or None
         created = int(time.time())
 
         if stream:
@@ -767,6 +822,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
+                requested_model=requested_model,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
@@ -784,6 +840,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
+                requested_model=requested_model,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
             )
@@ -1487,6 +1544,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Reuse session from previous_response_id chain so the dashboard
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
+        requested_model = (body.get("model") or "").strip() or None
 
         stream = bool(body.get("stream", False))
         if stream:
@@ -1533,6 +1591,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
+                requested_model=requested_model,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
@@ -1566,6 +1625,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
+                requested_model=requested_model,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
             )
@@ -1985,6 +2045,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self,
         user_message: str,
         conversation_history: List[Dict[str, str]],
+        requested_model: Optional[str] = None,
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
@@ -2008,6 +2069,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             agent = self._create_agent(
+                requested_model=requested_model,
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
@@ -2176,10 +2238,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         session_id = body.get("session_id") or stored_session_id or run_id
         ephemeral_system_prompt = instructions
+        requested_model = (body.get("model") or "").strip() or None
 
         async def _run_and_close():
             try:
                 agent = self._create_agent(
+                    requested_model=requested_model,
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,

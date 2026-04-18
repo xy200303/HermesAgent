@@ -664,18 +664,45 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     Anthropic's API returns errors like:
       "max_tokens: 32768 > context_window: 200000 - input_tokens: 190000 = available_tokens: 10000"
 
+    Some OpenAI-compatible proxies instead report the model's hard output cap, e.g.:
+      "Range of max_tokens should be [1, 16384]"
+      "max_tokens must be between 1 and 16384"
+
     Returns the number of output tokens that would fit (e.g. 10000 above), or None if
     the error does not look like a max_tokens-too-large error.
     """
     error_lower = error_msg.lower()
 
     # Must look like an output-cap error, not a prompt-length error.
-    is_output_cap_error = (
+    is_available_tokens_error = (
         "max_tokens" in error_lower
         and ("available_tokens" in error_lower or "available tokens" in error_lower)
     )
+    is_range_error = (
+        "max_tokens" in error_lower
+        and (
+            "range of max_tokens" in error_lower
+            or "max_tokens should be" in error_lower
+            or "max_tokens must be between" in error_lower
+        )
+    )
+    is_output_cap_error = is_available_tokens_error or is_range_error
     if not is_output_cap_error:
         return None
+
+    # Extract proxy-reported hard caps first.
+    range_patterns = [
+        r'range of max_tokens should be\s*\[\s*\d+\s*,\s*(\d+)\s*\]',
+        r'max_tokens should be\s*\[\s*\d+\s*,\s*(\d+)\s*\]',
+        r'max_tokens must be between\s+\d+\s+and\s+(\d+)',
+        r'max_tokens.*?\b(?:at most|<=|less than or equal to)\s*(\d+)',
+    ]
+    for pattern in range_patterns:
+        match = re.search(pattern, error_lower)
+        if match:
+            tokens = int(match.group(1))
+            if tokens >= 1:
+                return tokens
 
     # Extract the available_tokens figure.
     # Anthropic format: "… = available_tokens: 10000"

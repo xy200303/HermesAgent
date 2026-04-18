@@ -337,29 +337,63 @@ class TestHealthDetailedEndpoint:
 
 class TestModelsEndpoint:
     @pytest.mark.asyncio
-    async def test_models_returns_hermes_agent(self, adapter):
+    async def test_models_returns_upstream_list(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.get("/v1/models")
+            with patch.object(
+                adapter,
+                "_fetch_upstream_models_payload",
+                new=AsyncMock(return_value={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "openai/gpt-4.1",
+                            "object": "model",
+                            "created": 1760000000,
+                            "owned_by": "openai",
+                            "permission": [],
+                            "root": "openai/gpt-4.1",
+                            "parent": None,
+                        },
+                        {
+                            "id": "minimax-m2.5",
+                            "object": "model",
+                            "created": 1760000000,
+                            "owned_by": "custom",
+                            "permission": [],
+                            "root": "minimax-m2.5",
+                            "parent": None,
+                        },
+                    ],
+                }),
+            ):
+                resp = await cli.get("/v1/models")
             assert resp.status == 200
             data = await resp.json()
             assert data["object"] == "list"
-            assert len(data["data"]) == 1
-            assert data["data"][0]["id"] == "hermes-agent"
-            assert data["data"][0]["owned_by"] == "hermes"
+            assert [item["id"] for item in data["data"]] == [
+                "openai/gpt-4.1",
+                "minimax-m2.5",
+            ]
 
     @pytest.mark.asyncio
-    async def test_models_returns_profile_name(self):
-        """When running under a named profile, /v1/models advertises the profile name."""
+    async def test_models_falls_back_to_profile_name(self):
+        """When upstream discovery fails, /v1/models falls back to the local advertised name."""
         with patch("gateway.platforms.api_server.APIServerAdapter._resolve_model_name", return_value="lucas"):
             adapter = _make_adapter()
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.get("/v1/models")
+            with patch.object(
+                adapter,
+                "_fetch_upstream_models_payload",
+                new=AsyncMock(return_value=None),
+            ):
+                resp = await cli.get("/v1/models")
             assert resp.status == 200
             data = await resp.json()
             assert data["data"][0]["id"] == "lucas"
             assert data["data"][0]["root"] == "lucas"
+            assert data["data"][0]["owned_by"] == "hermes"
 
     @pytest.mark.asyncio
     async def test_models_returns_explicit_model_name(self):
@@ -398,6 +432,42 @@ class TestModelsEndpoint:
                 headers={"Authorization": "Bearer sk-secret"},
             )
             assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_fetch_upstream_models_payload_builds_openai_model_objects(self, adapter):
+        with patch(
+            "hermes_cli.models.fetch_api_models",
+            return_value=["openai/gpt-4.1", "openai/gpt-4.1", "minimax-m2.5"],
+        ), patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "api_key": "sk-test",
+                "base_url": "https://example.com/v1",
+                "provider": "custom",
+            },
+        ):
+            payload = await adapter._fetch_upstream_models_payload()
+
+        assert payload is not None
+        assert payload["object"] == "list"
+        assert [item["id"] for item in payload["data"]] == [
+            "openai/gpt-4.1",
+            "minimax-m2.5",
+        ]
+        assert payload["data"][0]["owned_by"] == "custom"
+
+    @pytest.mark.asyncio
+    async def test_fetch_upstream_models_payload_returns_none_when_unavailable(self, adapter):
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "sk-test", "base_url": "https://example.com/v1", "provider": "custom"},
+        ), patch(
+            "hermes_cli.models.fetch_api_models",
+            return_value=None,
+        ):
+            payload = await adapter._fetch_upstream_models_payload()
+
+        assert payload is None
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +537,27 @@ class TestChatCompletionsEndpoint:
                 assert "data: " in body
                 assert "[DONE]" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_forwards_requested_model(self, adapter):
+        """Chat Completions forwards request.model into the real agent run."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "Hello!", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "openai/gpt-4.1",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.call_args.kwargs["requested_model"] == "openai/gpt-4.1"
 
     @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
@@ -970,6 +1061,35 @@ class TestResponsesEndpoint:
             assert call_kwargs["ephemeral_system_prompt"] == "Talk like a pirate."
 
     @pytest.mark.asyncio
+    async def test_run_agent_uses_requested_model_for_responses(self, adapter):
+        """Responses API can override the actual AIAgent model via request.model."""
+
+        class FakeAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def run_conversation(self, user_message, conversation_history=None, task_id=None):
+                return {"final_response": "Done", "messages": []}
+
+        captured = {}
+
+        def fake_create_agent(*args, **kwargs):
+            captured["requested_model"] = kwargs.get("requested_model")
+            return FakeAgent()
+
+        with patch.object(adapter, "_create_agent", side_effect=fake_create_agent):
+            result, usage = await adapter._run_agent(
+                user_message="Hello",
+                conversation_history=[],
+                requested_model="openai/gpt-4.1",
+            )
+
+        assert captured["requested_model"] == "openai/gpt-4.1"
+        assert result["final_response"] == "Done"
+        assert usage["total_tokens"] == 0
+
+    @pytest.mark.asyncio
     async def test_previous_response_id_chaining(self, adapter):
         """Test that responses can be chained via previous_response_id."""
         mock_result_1 = {
@@ -1282,6 +1402,43 @@ class TestResponsesStreaming:
                 assert data["id"] == response_id
                 assert data["status"] == "completed"
                 assert data["output"][-1]["content"][0]["text"] == "Stored response"
+
+
+class TestRunsEndpoint:
+    @pytest.mark.asyncio
+    async def test_runs_forwards_requested_model(self, adapter):
+        """Runs API forwards request.model into the real agent creation path."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            class FakeAgent:
+                session_prompt_tokens = 0
+                session_completion_tokens = 0
+                session_total_tokens = 0
+
+                def run_conversation(self, user_message, conversation_history=None, task_id=None):
+                    return {"final_response": "Done", "messages": []}
+
+            captured = {}
+
+            def fake_create_agent(*args, **kwargs):
+                captured["requested_model"] = kwargs.get("requested_model")
+                return FakeAgent()
+
+            with patch.object(adapter, "_create_agent", side_effect=fake_create_agent):
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "model": "openai/gpt-4.1",
+                        "input": "hello",
+                    },
+                )
+
+                assert resp.status == 202
+                await asyncio.sleep(0.05)
+
+            assert captured["requested_model"] == "openai/gpt-4.1"
 
 
 # ---------------------------------------------------------------------------

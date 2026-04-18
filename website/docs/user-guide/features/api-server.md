@@ -10,6 +10,8 @@ The API server exposes hermes-agent as an OpenAI-compatible HTTP endpoint. Any f
 
 Your agent handles requests with its full toolset (terminal, file operations, web search, memory, skills) and returns the final response. When streaming, tool progress indicators appear inline so frontends can show what the agent is doing.
 
+For a frontend-facing endpoint-by-endpoint reference with request examples, streaming event details, and integration guidance, see [API Server Reference](/docs/reference/api-server-reference).
+
 ## Quick Start
 
 ### 1. Enable the API server

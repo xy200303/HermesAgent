@@ -72,6 +72,16 @@ class TestParseAvailableOutputTokens:
         msg = "max_tokens: 9999 > context_window: 10000 - input_tokens: 9999 = available_tokens: 1"
         assert self._parse(msg) == 1
 
+    def test_range_of_max_tokens_format(self):
+        """OpenAI-compatible proxies may return a hard allowed range instead of available_tokens."""
+        msg = "<400> InternalError.Algo.InvalidParameter: Range of max_tokens should be [1, 16384]"
+        assert self._parse(msg) == 16384
+
+    def test_max_tokens_between_format(self):
+        """Natural-language upper bound variants should also be parsed."""
+        msg = "invalid_request_error: max_tokens must be between 1 and 8192"
+        assert self._parse(msg) == 8192
+
     # ── Should NOT detect (returns None) ─────────────────────────────────
 
     def test_prompt_too_long_is_not_output_cap_error(self):
